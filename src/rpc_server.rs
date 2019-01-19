@@ -3,7 +3,8 @@ use factory::{DefaultFactory, Factory};
 use fibers::net::futures::{Connected, TcpListenerBind};
 use fibers::net::streams::Incoming;
 use fibers::net::TcpListener;
-use fibers::sync::mpsc;
+use fibers::sync::{mpsc, oneshot};
+use fibers::time::timer::{self, Timeout};
 use fibers::{self, BoxSpawn, Spawn};
 use futures::future::{loop_fn, Either, Loop};
 use futures::{self, Async, Future, Poll, Stream};
@@ -12,6 +13,7 @@ use slog::{Discard, Logger};
 use std::collections::HashMap;
 use std::mem;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use channel::ChannelOptions;
 use message::OutgoingMessage;
@@ -220,6 +222,7 @@ impl ServerBuilder {
         let logger = self.logger.new(o!("server" => self.bind_addr.to_string()));
         info!(logger, "Starts RPC server");
         let handlers = mem::replace(&mut self.handlers, MessageHandlers(HashMap::new()));
+        let (request_tx, request_rx) = mpsc::channel();
         Server {
             listener: Listener::Binding(TcpListener::bind(self.bind_addr)),
             logger,
@@ -227,6 +230,10 @@ impl ServerBuilder {
             assigner: Assigner::new(handlers),
             channel_options: self.channel_options.clone(),
             metrics: ServerMetrics::new(self.metrics.clone(), self.handlers_metrics.clone()),
+            request_tx,
+            request_rx,
+            running_shutdown: None,
+            shutdown_notifications: Vec::new(),
         }
     }
 }
@@ -241,6 +248,10 @@ pub struct Server<S> {
     assigner: Assigner,
     channel_options: ChannelOptions,
     metrics: ServerMetrics,
+    request_tx: mpsc::Sender<ServerRequest>,
+    request_rx: mpsc::Receiver<ServerRequest>,
+    running_shutdown: Option<Timeout>,
+    shutdown_notifications: Vec<oneshot::Monitored<(), Error>>,
 }
 impl<S> Server<S> {
     /// Returns a future that retrieves the address to which the server is bound.
@@ -269,6 +280,20 @@ impl<S> Server<S> {
     pub fn metrics(&self) -> &ServerMetrics {
         &self.metrics
     }
+
+    /// Returns the handle of the server.
+    pub fn handle(&self) -> ServerHandle {
+        ServerHandle(self.request_tx.clone())
+    }
+
+    fn handle_request(&mut self, request: ServerRequest) {
+        match request {
+            ServerRequest::Shutdown { timeout, reply } => {
+                self.running_shutdown = Some(timer::timeout(timeout));
+                self.shutdown_notifications.push(reply);
+            }
+        }
+    }
 }
 impl<S> Future for Server<S>
 where
@@ -278,6 +303,32 @@ where
     type Error = Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        while let Async::Ready(Some(request)) = self.request_rx.poll().expect("Never fails") {
+            debug!(self.logger, "Handle a new request: {:?}", request);
+            self.handle_request(request);
+        }
+
+        // Wait for active connections until shutdown timer completes.
+        if let Some(ref mut timer) = self.running_shutdown {
+            // Avoids borrow checker issue here.
+            // `self.metrics.channels().as_map().load().keys().len() >= 0` means that
+            // the server has at least one active connection.
+            let finished = if self.metrics.channels().as_map().load().keys().len() > 0 {
+                timer.poll().expect("Borken timer").is_ready()
+            } else {
+                true
+            };
+
+            if finished {
+                for reply in self.shutdown_notifications.drain(..) {
+                    reply.exit(Ok(()));
+                }
+                return Ok(Async::Ready(()));
+            } else {
+                return Ok(Async::NotReady);
+            }
+        }
+
         while let Async::Ready(item) = track!(self.listener.poll())? {
             if let Some((client, addr)) = item {
                 let logger = self.logger.new(o!("client" => addr.to_string()));
@@ -312,10 +363,30 @@ where
                 }));
             } else {
                 info!(self.logger, "RPC server stopped");
+                for reply in self.shutdown_notifications.drain(..) {
+                    reply.exit(Ok(()));
+                }
                 return Ok(Async::Ready(()));
             }
         }
         Ok(Async::NotReady)
+    }
+}
+
+#[derive(Debug)]
+enum ServerRequest {
+    Shutdown {
+        timeout: Duration,
+        reply: oneshot::Monitored<(), Error>,
+    }
+}
+
+pub struct ServerHandle(mpsc::Sender<ServerRequest>);
+impl ServerHandle {
+    pub fn shutdown(&self, timeout: Duration) -> impl Future<Item = (), Error = Error> {
+        let (monitored, monitor) = oneshot::monitor();
+        let _ = self.0.send(ServerRequest::Shutdown { timeout, reply: monitored, });
+        monitor.map_err(|e| track!(Error::from(e)))
     }
 }
 

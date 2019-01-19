@@ -1,4 +1,5 @@
 use bytecodec;
+use fibers;
 use std;
 use trackable::error::{ErrorKind as TrackableErrorKind, ErrorKindExt, Failure, TrackableError};
 
@@ -23,6 +24,15 @@ impl From<bytecodec::Error> for Error {
             _ => ErrorKind::Other,
         };
         kind.takes_over(f).into()
+    }
+}
+impl From<fibers::sync::oneshot::MonitorError<Error>> for Error {
+    fn from(f: fibers::sync::oneshot::MonitorError<Error>) -> Self {
+        f.unwrap_or_else(|| {
+            ErrorKind::Other
+                .cause("Monitor channel disconnected")
+                .into()
+        })
     }
 }
 
